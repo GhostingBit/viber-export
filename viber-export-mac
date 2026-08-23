@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# viber-export-mac — decrypt a macOS Viber viber.db to a plaintext SQLite file.
+# Tries the username-derived key (aes128:reverse(login-name)) first, else runs Viber.app
+# headless under lldb to read its PRAGMA hexkey. Source db never modified. See INTERNALS.md.
+#   ./viber-export-mac <path/to/viber.db> <output.db>
+#   (foreign backup? pass VIBER_USERNAME=<original-login-name>)
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"; source "$here/lib/viber-common.sh"
+[ "$(vc_platform)" = mac ] || { echo "this is the macOS tool; on Linux use viber-export-linux"; exit 1; }
+[ $# -eq 2 ] || { echo "usage: $0 <viber.db> <output.db>"; exit 1; }
+IN="$(cd "$(dirname "$1")"&&pwd)/$(basename "$1")"; OUT="$2"; [ -f "$IN" ] || { echo "not found: $IN"; exit 1; }
+VPC="$(dirname "$(dirname "$IN")")"
+vc_init "$here"; vc_prepare
+echo "[*] discovering key..."
+KEY="$(vc_find_key "$VPC" "$IN")" || { echo "could not discover key (for a foreign backup pass VIBER_USERNAME=<orig-login-name>)"; exit 1; }
+vc_dump "$IN" "$KEY" "$OUT" && { echo "[+] exported -> $OUT ($(sqlite3 "$OUT" 'SELECT count(*) FROM Messages' 2>/dev/null) messages)"; exit 0; }
+echo "decrypt failed"; exit 1

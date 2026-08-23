@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# viber-export-linux — decrypt a Linux Viber viber.db to a plaintext SQLite file.
+# Auto-discovers the key (runs Viber headless/offline, reads its PRAGMA hexkey) and decrypts
+# with Viber's own codec. The source db is never modified. See README.md / INTERNALS.md.
+#   ./viber-export-linux <path/to/viber.db> <output.db>
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"; source "$here/lib/viber-common.sh"
+[ "$(vc_platform)" = linux ] || { echo "this is the Linux tool; on macOS use viber-export-mac"; exit 1; }
+[ $# -eq 2 ] || { echo "usage: $0 <viber.db> <output.db>"; exit 1; }
+IN="$(readlink -f "$1")"; OUT="$2"; [ -f "$IN" ] || { echo "not found: $IN"; exit 1; }
+VPC="$(dirname "$(dirname "$IN")")"; [ -f "$VPC/config.db" ] || { echo "<viber.db> must be inside .../ViberPC/<phone>/"; exit 1; }
+vc_init "$here"; vc_prepare
+echo "[*] discovering key..."
+KEY="$(vc_find_key "$VPC" "$IN")" || { echo "could not discover key"; exit 1; }
+vc_dump "$IN" "$KEY" "$OUT" && { echo "[+] exported -> $OUT ($(sqlite3 "$OUT" 'SELECT count(*) FROM Messages' 2>/dev/null) messages)"; exit 0; }
+echo "decrypt failed"; exit 1

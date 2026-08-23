@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# viber-merge — merge a decrypted Viber history into a target install's viber.db.
+# Auto-detects the target platform (Linux/macOS), finds the target's key, decrypts it,
+# appends every message the target is missing (from <source>), de-duplicates chats, and
+# re-encrypts the result with the target's own key — ready to install.
+#
+#   ./viber-merge <source-decrypted.db> <target-viber.db> <output-encrypted.db>
+#
+# <source-decrypted.db> : a PLAINTEXT export (produce it with viber-export-linux/mac first;
+#                          it may come from the OTHER platform — the schema is the same).
+# <target-viber.db>     : the ENCRYPTED viber.db of the install you want to merge INTO
+#                          (must live in a normal .../ViberPC/<phone>/ profile).
+# <output-encrypted.db> : where to write the merged, re-encrypted db.
+#
+# The live target is never modified. To apply: quit Viber, back up the target viber.db,
+# copy <output> over it, and delete any viber.db-wal / -shm. See INTERNALS.md.
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=lib/viber-common.sh
+source "$here/lib/viber-common.sh"
+[ $# -eq 3 ] || { echo "usage: $0 <source-decrypted.db> <target-viber.db> <output.db>"; exit 1; }
+abspath(){ if [ -d "$1" ]; then (cd "$1" && pwd); else printf '%s/%s\n' "$(cd "$(dirname "$1")" && pwd)" "$(basename "$1")"; fi; }
+SRC="$(abspath "$1")"; TGT="$(abspath "$2")"; OUT="$3"
+[ -f "$SRC" ] || { echo "source not found: $SRC"; exit 1; }
+[ -f "$TGT" ] || { echo "target not found: $TGT"; exit 1; }
+head -c 15 "$SRC" | grep -q "SQLite format" || { echo "ERROR: <source> must be a DECRYPTED db. Run viber-export-* on it first."; exit 1; }
+VPC="$(dirname "$(dirname "$TGT")")"
+[ -f "$VPC/config.db" ] || { echo "ERROR: <target> must be inside a .../ViberPC/<phone>/ profile (no config.db found)."; exit 1; }
+command -v sqlite3 >/dev/null || { echo "need sqlite3"; exit 1; }
+
+vc_init "$here"; vc_prepare
+# work on a copy of the target so the live db is never touched
+cp -a "$TGT" "$VC_TMP/tgt.db"
+for e in -wal -shm; do [ -f "$TGT$e" ] && cp -a "$TGT$e" "$VC_TMP/tgt.db$e"; done
+
+echo "[*] discovering target key..."
+KEY="$(vc_find_key "$VPC" "$VC_TMP/tgt.db")" || { echo "ERROR: could not find the target's key."; exit 1; }
+echo "[*] decrypting target..."
+vc_dump "$VC_TMP/tgt.db" "$KEY" "$VC_TMP/tgt_plain.db" || { echo "ERROR: decrypt failed."; exit 1; }
+B=$(sqlite3 "$VC_TMP/tgt_plain.db" "SELECT count(*) FROM Messages" 2>/dev/null || echo '?')
+S=$(sqlite3 "$SRC" "SELECT count(*) FROM Messages" 2>/dev/null || echo '?')
+echo "    target has $B messages; source has $S"
+echo "[*] merging (target as base + source's missing history)..."
+python3 "$here/src/merge.py" "$VC_TMP/tgt_plain.db" "$SRC" "$VC_TMP/merged.db"
+echo "[*] de-duplicating chats..."
+python3 "$here/dedup-chats.py" "$VC_TMP/merged.db"
+echo "[*] re-encrypting with the target's key..."
+vc_encrypt "$VC_TMP/merged.db" "$KEY" "$OUT" || { echo "ERROR: re-encrypt failed."; exit 1; }
+echo "[*] verifying output round-trips..."
+vc_dump "$OUT" "$KEY" "$VC_TMP/verify.db" || { echo "ERROR: output does not decrypt!"; rm -f "$OUT"; exit 1; }
+M=$(sqlite3 "$VC_TMP/verify.db" "SELECT count(*) FROM Messages" 2>/dev/null)
+R=$(sqlite3 "$VC_TMP/verify.db" "PRAGMA integrity_check" 2>/dev/null | head -1)
+echo
+echo "[+] DONE -> $OUT   (messages: $M, integrity: $R)"
+echo "    To apply:  quit Viber; cp -a \"$TGT\" \"$TGT.bak\"; cp \"$OUT\" \"$TGT\"; rm -f \"$TGT\"-wal \"$TGT\"-shm"
