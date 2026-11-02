@@ -40,7 +40,7 @@ int main(int argc, char** argv){
             else fprintf(stderr,"  skip %s: %s\n", tb.toUtf8().constData(), c.lastError().text().toUtf8().constData());
           }
           QSqlQuery d(db); d.exec("DETACH DATABASE pln");
-          printf("OK: exported %d/%d tables -> %s\n", okc, tables.size(), out.toUtf8().constData());
+          printf("OK: exported %d/%lld tables -> %s\n", okc, (long long)tables.size(), out.toUtf8().constData());
           rc=0;
         }
       }
