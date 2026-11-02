@@ -9,24 +9,44 @@ vc_platform(){ case "$(uname -s)" in Darwin) echo mac;; Linux) echo linux;; *) e
 _VC_HERE=""   # set by vc_init to the toolkit root (dir containing src/)
 vc_init(){ _VC_HERE="$1"; }
 
+# Kill a process and every descendant of it. Deliberately scoped to this subtree only —
+# never `pkill -f Viber`, which would also match (and kill) a live Viber instance.
+_vc_kill_tree(){
+  local pid="$1" c
+  for c in $(pgrep -P "$pid" 2>/dev/null); do _vc_kill_tree "$c"; done
+  kill -KILL "$pid" 2>/dev/null || true
+}
+
 # ---- locate Viber + compile the dump/encrypt harnesses for this platform ----
 vc_prepare(){
   local plat; plat="$(vc_platform)"
   VC_TMP="$(mktemp -d)"; trap 'rm -rf "$VC_TMP"' EXIT
   if [ "$plat" = linux ]; then
-    for t in g++ pkg-config; do command -v "$t" >/dev/null || { echo "missing tool: $t" >&2; return 1; }; done
+    for t in g++ gcc pkg-config; do command -v "$t" >/dev/null || { echo "missing tool: $t" >&2; return 1; }; done
     pkg-config --exists Qt6Sql Qt6Core || { echo "missing Qt6 dev headers (Qt6Sql,Qt6Core)" >&2; return 1; }
-    local app="${VIBER_APPIMAGE:-}"
-    [ -z "$app" ] && app="$(grep -rhs '^Exec=' ~/.local/share/applications/ 2>/dev/null | grep -i viber | head -1 | sed -E 's/^Exec=//; s/ .*//')"
-    [ -z "$app" ] && app="$(ls "$HOME"/Applications/viber*.[aA]pp[iI]mage 2>/dev/null | head -1 || true)"
-    [ -n "$app" ] && [ -x "$app" ] || { echo "Viber AppImage not found; set VIBER_APPIMAGE=/path" >&2; return 1; }
-    echo "[*] Viber AppImage: $app" >&2
-    ( cd "$VC_TMP" && "$app" --appimage-extract >/dev/null 2>&1 )
-    VC_SR="$VC_TMP/squashfs-root"; [ -x "$VC_SR/usr/bin/Viber" ] || { echo "extract failed" >&2; return 1; }
+    # Pick a Viber install: prefer a system install (VIBER_APP, else /opt/viber) when it has the
+    # codec; else fall back to the AppImage (extracted into VC_TMP). One install is used for both
+    # the codec (dump/encrypt) and the capture binary (vc_runtime_keys), so they stay consistent.
+    local sys="${VIBER_APP:-}"
+    [ -z "$sys" ] && [ -x /opt/viber/Viber ] && [ -f /opt/viber/plugins/sqldrivers/libqsqlite.so ] && sys=/opt/viber
+    if [ -n "$sys" ] && [ -x "$sys/Viber" ] && [ -f "$sys/plugins/sqldrivers/libqsqlite.so" ]; then
+      echo "[*] Viber install: $sys" >&2
+      VC_VIBERBIN="$sys/Viber"; VC_RUN_LD="$sys/lib"; VC_RUN_PLUG="$sys/plugins"
+    else
+      local app="${VIBER_APPIMAGE:-}"
+      [ -z "$app" ] && app="$(grep -rhs '^Exec=' ~/.local/share/applications/ 2>/dev/null | grep -i viber | head -1 | sed -E 's/^Exec=//; s/ .*//')"
+      [ -z "$app" ] && app="$(ls "$HOME"/Applications/viber*.[aA]pp[iI]mage 2>/dev/null | head -1 || true)"
+      [ -n "$app" ] && [ -x "$app" ] || { echo "no Viber install found; set VIBER_APP or VIBER_APPIMAGE=/path" >&2; return 1; }
+      echo "[*] Viber AppImage: $app" >&2
+      ( cd "$VC_TMP" && "$app" --appimage-extract >/dev/null 2>&1 )
+      [ -x "$VC_TMP/squashfs-root/usr/bin/Viber" ] || { echo "extract failed" >&2; return 1; }
+      VC_VIBERBIN="$VC_TMP/squashfs-root/usr/bin/Viber"; VC_RUN_LD="$VC_TMP/squashfs-root/usr/lib"; VC_RUN_PLUG="$VC_TMP/squashfs-root/usr/plugins"
+    fi
     echo "[*] compiling harnesses..." >&2
-    g++ -O2 -std=c++17 "$_VC_HERE/src/dump.cpp"    -o "$VC_TMP/dump"    $(pkg-config --cflags Qt6Sql Qt6Core) "$VC_SR/usr/lib/libQt6Sql.so.6" "$VC_SR/usr/lib/libQt6Core.so.6" -Wl,-rpath,"$VC_SR/usr/lib"
-    g++ -O2 -std=c++17 "$_VC_HERE/src/encrypt.cpp" -o "$VC_TMP/encrypt" $(pkg-config --cflags Qt6Sql Qt6Core) "$VC_SR/usr/lib/libQt6Sql.so.6" "$VC_SR/usr/lib/libQt6Core.so.6" -Wl,-rpath,"$VC_SR/usr/lib"
-    VC_RUN_LD="$VC_SR/usr/lib"; VC_RUN_PLUG="$VC_SR/usr/plugins"; VC_VIBERBIN="$VC_SR/usr/bin/Viber"
+    g++ -O2 -std=c++17 "$_VC_HERE/src/dump.cpp"    -o "$VC_TMP/dump"    $(pkg-config --cflags Qt6Sql Qt6Core) "$VC_RUN_LD/libQt6Sql.so.6" "$VC_RUN_LD/libQt6Core.so.6" -Wl,-rpath,"$VC_RUN_LD"
+    g++ -O2 -std=c++17 "$_VC_HERE/src/encrypt.cpp" -o "$VC_TMP/encrypt" $(pkg-config --cflags Qt6Sql Qt6Core) "$VC_RUN_LD/libQt6Sql.so.6" "$VC_RUN_LD/libQt6Core.so.6" -Wl,-rpath,"$VC_RUN_LD"
+    gcc -O2 -fPIC -shared "$_VC_HERE/src/preload.c" -o "$VC_TMP/preload.so" -ldl
+    VC_PRELOAD="$VC_TMP/preload.so"
   else # mac
     command -v clang++ >/dev/null || { echo "need Xcode CLT: xcode-select --install" >&2; return 1; }
     local app="${VIBER_APP:-}"
@@ -65,10 +85,13 @@ vc_encrypt(){ # <plain-db> <key> <out-db> -> 0 on success
   else QT_PLUGIN_PATH="$VC_PLUG" DYLD_FRAMEWORK_PATH="$VC_FW" "$VC_ENCRYPT" "$1" "$2" "$3" 2>/dev/null | grep -q 'ENCRYPTED'; fi
 }
 
-vc_cheap_keys(){ # echoes cheap candidate keys (no Viber run). macOS: aes128:reverse(username)
-  if [ "$(vc_platform)" = mac ]; then
-    local u; u="${VIBER_USERNAME:-$USER}"; printf '%s' "aes128:$(printf '%s' "$u" | rev)" | xxd -p | tr -d '\n'; echo
-  fi
+vc_cheap_keys(){ # echoes cheap candidate keys (no Viber run).
+  # Both macOS and Linux accept the username-based key: "aes128:" + reverse(login-username).
+  # (Linux tries a profile-derived 64-hex key first, then this one; many profiles are
+  #  actually encrypted with THIS key, so it is the reliable first guess.)
+  local u; u="${VIBER_USERNAME:-${USER:-$(id -un 2>/dev/null || true)}}"
+  [ -n "$u" ] || return 0
+  printf '%s' "aes128:$(printf '%s' "$u" | rev)" | xxd -p | tr -d '\n'; echo
 }
 
 # run Viber headless+offline against a COPY of the profile and echo captured hexkeys (expensive)
@@ -77,45 +100,33 @@ vc_runtime_keys(){ # <viberpc-dir> <viber-db>
   local phone; phone="$(basename "$(dirname "$IN")")"
   local klog="$VC_TMP/keys.$$"; : > "$klog"
   if [ "$plat" = linux ]; then
-    local home="$VC_TMP/home"; mkdir -p "$home/run" "$home/.ViberPC/$phone"
+    local home="$VC_TMP/home"; mkdir -p "$home/tmp" "$home/run" "$home/.ViberPC/$phone"
     cp -a "$VPC/config.db" "$home/.ViberPC/" 2>/dev/null || true
     cp -a "$VPC/data" "$home/.ViberPC/" 2>/dev/null || true
     cp -a "$IN" "$home/.ViberPC/$phone/viber.db"
     for f in data.db data.db-wal data.db-shm; do cp -a "$(dirname "$IN")/$f" "$home/.ViberPC/$phone/" 2>/dev/null || true; done
-    cat > "$VC_TMP/cap.py" <<PY
-import gdb
-LOG=open("$klog","a"); st={'db':''}
-def qs(a):
-    i=gdb.selected_inferior(); p=int.from_bytes(i.read_memory(a+8,8),'little'); n=int.from_bytes(i.read_memory(a+16,8),'little')
-    return bytes(i.read_memory(p,n*2)).decode('utf-16-le','replace') if (0<n<8192 and p) else ''
-def onexec():
-    s=qs(int(gdb.selected_frame().read_register('rsi')))
-    if 'hexkey' in s: LOG.write(s+"\n"); LOG.flush()
-    gdb.execute('continue')
-PY
-    cat > "$VC_TMP/g.gdb" <<GDB
-set pagination off
-set confirm off
-set breakpoint pending on
-set environment HOME=$home
-set environment QT_QPA_PLATFORM=offscreen
-set environment LD_LIBRARY_PATH=$VC_SR/usr/lib:$VC_SR/usr/lib/qt6
-set environment QT_PLUGIN_PATH=$VC_SR/usr/plugins
-set environment XDG_RUNTIME_DIR=$home/run
-set environment QTWEBENGINE_DISABLE_SANDBOX=1
-handle SIGSEGV nostop noprint pass
-handle SIGPIPE nostop noprint pass
-source $VC_TMP/cap.py
-break QSqlQuery::exec(QString const&)
-commands
- silent
- python onexec()
-end
-run --no-sandbox --disable-gpu
-GDB
-    ( timeout 130 unshare -rn env -i PATH=/usr/bin:/bin HOME="$home" TERM=xterm gdb -batch -x "$VC_TMP/g.gdb" "$VC_VIBERBIN" >/dev/null 2>&1 ) &
-    local bg=$!; for i in $(seq 1 26); do sleep 5; grep -q hexkey "$klog" 2>/dev/null && break; done
-    kill $bg 2>/dev/null || true; pkill -9 -f "$VC_VIBERBIN" 2>/dev/null || true
+    # Run the real Viber offline (user+net namespace) as the profile owner, with the LD_PRELOAD
+    # interposer logging the PRAGMA hexkey it issues. No debugger needed — the interposer hooks a
+    # single exported Qt symbol, so it is stable across Viber/Qt versions (gdb is not, on a
+    # multithreaded Qt app). We map our own outside uid to the owner's uid so the username-based
+    # key is derived correctly whether the tool is run by the owner or by root; an isolated TMPDIR
+    # keeps the QtSingleApplication lock (bound to uid+tempdir) from clashing with a live instance.
+    local uid user myuid
+    uid="$(stat -c %u "$IN" 2>/dev/null || id -u)"
+    user="${VIBER_USERNAME:-$(stat -c %U "$IN" 2>/dev/null || id -un)}"
+    myuid="$(id -u)"
+    unshare -U -n --map-users="$uid:$myuid:1" --map-groups="$uid:$myuid:1" env -i \
+      PATH=/usr/bin:/bin TERM=xterm LANG=C.UTF-8 \
+      HOME="$home" USER="$user" LOGNAME="$user" \
+      TMPDIR="$home/tmp" XDG_RUNTIME_DIR="$home/run" \
+      QT_QPA_PLATFORM=offscreen \
+      LD_LIBRARY_PATH="$VC_RUN_LD" QT_PLUGIN_PATH="$VC_RUN_PLUG" \
+      QTWEBENGINE_DISABLE_SANDBOX=1 \
+      LD_PRELOAD="$VC_PRELOAD" VIBER_PRELOAD_LOG="$klog" \
+      "$VC_VIBERBIN" --no-sandbox --disable-gpu >/dev/null 2>&1 &
+    local bg=$! i
+    for i in $(seq 1 30); do sleep 2; if grep -q hexkey "$klog" 2>/dev/null; then break; fi; if ! kill -0 "$bg" 2>/dev/null; then break; fi; done
+    _vc_kill_tree "$bg"
   else # mac
     local home="$VC_TMP/home"; mkdir -p "$home/Library/Application Support/ViberPC/$phone"
     cp -a "$VPC/config.db" "$home/Library/Application Support/ViberPC/" 2>/dev/null || true

@@ -1,0 +1,12 @@
+# Local debug artifacts and throwaway working files (gdb scripts, test dbs, logs, home dirs)
+.debug/
+
+# Editor swap / backup files
+*.swp
+*.swo
+*~
+
+# Decrypted output databases — contain personal message data, never commit
+viber-plaintext.db
+*.db-wal
+*.db-shm

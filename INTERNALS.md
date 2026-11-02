@@ -40,31 +40,49 @@ scheme. So the *value* passed to hexkey is itself hex; e.g. Viber passes
 
 The key is **not stored**; Viber derives it at runtime and calls `PRAGMA hexkey`.
 
-* **macOS (this profile's scheme): `key = "aes128:" + reverse(macOS-login-username)`.**
-  Example: login name `j.doe` → key string `aes128:eod.j`, hex-encoded and passed to `hexkey`. This is why
-  a Linux-derived key never opens a macOS db, and why the export tool must know the *original*
-  login name for a foreign backup (`VIBER_USERNAME`). Newer macOS builds also try a
-  default 64-hex key first (folder/DeviceKey-derived) then fall back to the aes128 one — Viber
-  issues both `PRAGMA hexkey` calls in sequence and uses whichever decrypts.
-* **Linux: default scheme, a 64-hex key** derived from the profile (involves the account id +
-  `config.db` DeviceKey, hashed with SHA-256; the exact transform was not fully reversed).
-  Because it isn't a simple formula, the Linux tool **captures** it rather than computing it.
+Viber (on **both** Linux and macOS) has two candidate keys and tries them in order, using
+whichever decrypts:
 
-Reverse-engineering notes for the derivation (Linux binary): the QString the app hands to
+1. **Main key** — a 64-hex string (default scheme), derived from the profile: the account id +
+   `config.db` `DeviceKey`, hashed with SHA-256. It is **uid-independent** (same value for the
+   same account regardless of OS user). The exact transform was not fully reversed, so the tool
+   **captures** it rather than computing it.
+2. **Username key** — `key = "aes128:" + reverse(login-username)`. Deterministic: reverse the
+   *entire* login name, character by character, preserving case. Example: login `dmitry` →
+   `aes128:yrtimd`; login `j.doe` → `aes128:eod.j`. Hex-encoded and passed to `hexkey`.
+
+**This profile's db was encrypted with the username key, not the main key** — the 64-hex main
+key does *not* open it. So on Linux the username key is not just a fallback: it can be the
+*primary* key. The export tool therefore computes the username key directly (no runtime capture
+needed when you know the login name) and also captures the main key as a fallback. For a foreign
+backup the tool must know the *original* login name (`VIBER_USERNAME`).
+
+> **Gotcha — reverse the whole name, in full.** The username key is the *complete* reversal of
+> the login name. `dmitry` → `yrtimd` (works). A partial or case-mangled reversal (e.g. `rytmiD`)
+> will *not* decrypt — it feeds the wrong bytes to the AES key.
+
+Reverse-engineering notes for the main key (Linux binary): the QString the app hands to
 `PRAGMA hexkey='%1'` is built in a helper that does `hexkey = toHex(SHA256(utf8(seed)))`
 (Qt `QCryptographicHash::Sha256`, algo id 4); `seed` comes from an `OriginNumber_<id>` lookup
-+ the default Account struct. If you need to compute keys offline, start there.
++ the default Account struct. If you need to compute the main key offline, start there.
 
 ## 4. Discovering the key at runtime (version-independent)
 
-Both tools hook **`QSqlQuery::exec(const QString&)`** — mangled `_ZN9QSqlQuery4execERK7QString`,
-an *exported* Qt symbol, so it survives version changes. Read the `QString&` argument
-(Qt6 layout: `{ d@0, char16_t* ptr@8, qsizetype size@16 }`; arg is in `rsi` on x86-64 / `x1`
-on arm64) and grab any SQL containing `hexkey`. Correlate with
-`QSqlDatabase::setDatabaseName` (`_ZN12QSqlDatabase15setDatabaseNameERK7QString`) to know which
-db each key is for. Run Viber **headless** (`QT_QPA_PLATFORM=offscreen`) and **offline**
-(Linux: `unshare -rn`; macOS: no network needed) so it never links a device or syncs — key
-derivation happens locally during startup, before/independent of sign-in.
+The tool hooks **`QSqlQuery::exec(const QString&)`** — mangled `_ZN9QSqlQuery4execERK7QString`,
+an *exported* Qt symbol, so it survives version changes. The hook is an **LD_PRELOAD interposer**
+(`src/preload.c`): it interposes the exported symbol, reads the `QString&` argument (Qt6 layout:
+`{ d@0, char16_t* ptr@8, qsizetype size@16 }`), and logs any SQL containing `hexkey` to
+`$VIBER_PRELOAD_LOG`. LD_PRELOAD is more reliable than gdb on multithreaded Qt (gdb's
+stop/resume races the event loop and can hang a live Viber), and it leaves the live process
+running. Correlate with `QSqlDatabase::setDatabaseName`
+(`_ZN12QSqlDatabase15setDatabaseNameERK7QString`) to know which db each key is for.
+
+Run Viber **headless** (`QT_QPA_PLATFORM=offscreen`) and **offline** so it never links a device
+or syncs — key derivation happens locally during startup, before/independent of sign-in. On Linux
+the tool isolates the run with `unshare -U -n --map-users=<owner-uid>:<tool-uid>:1` (plus the
+matching `--map-groups`) so the *login username* — and hence the username key — derives correctly
+whether the tool is run by the profile owner or by root, and uses a distinct `TMPDIR` to dodge the
+`QtSingleApplication` lock (its hash is bound to uid + tempdir).
 
 To run headless you need the **offscreen** platform plugin. The Linux AppImage bundles it;
 **macOS Viber ships only `libqcocoa.dylib`**, so the mac tool copies an `libqoffscreen.dylib`
@@ -73,7 +91,8 @@ of the *same Qt version* into a throwaway copy of `Viber.app`.
 macOS extra: Viber.app is notarized with **hardened runtime**, so lldb can't debug it. The
 tool re-signs a *copy* ad-hoc (`codesign -f -s - --deep`) which drops hardened runtime — no
 admin needed. (An earlier all-in-one approach used gdb's `setKey` at a hardcoded address
-`0x1fac6f0` for Viber 27.3.0.2 Linux — version-specific; prefer the symbol hook above.)
+`0x1fac6f0` for Viber 27.3.0.2 Linux — version-specific; the LD_PRELOAD interposer above
+replaced it.)
 
 ## 5. Decrypting (`src/dump.cpp`)
 
